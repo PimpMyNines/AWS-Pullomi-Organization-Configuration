@@ -1,8 +1,12 @@
+//Copyright (c) 2024 Shawn LoPresto
+//This source code is licensed under the MIT license found in the
+//LICENSE file in the root directory of this source tree.
+
 package organization
 
 import (
 	"fmt"
-	
+
 	"github.com/PimpMyNines/AWS-Pullomi-Organization-Configuration/internal/config"
 	"github.com/pulumi/pulumi-aws/sdk/v4/go/aws/organizations"
 	"github.com/pulumi/pulumi-aws/sdk/v4/go/aws/ssm"

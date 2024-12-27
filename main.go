@@ -1,9 +1,13 @@
+//Copyright (c) 2024 Shawn LoPresto
+//This source code is licensed under the MIT license found in the
+//LICENSE file in the root directory of this source tree.
+
 package main
 
 import (
-	"github.com/pimpmynine/aws-controltower-module/internal/controltower"
-	"github.com/pimpmynine/aws-controltower-module/internal/organization"
-	"github.com/pimpmynines/aws-controltower-module/internal/config"
+	"github.com/PimpMyNines/AWS-Pullomi-Organization-Configuration/internal/config"
+	"github.com/PimpMyNines/AWS-Pullomi-Organization-Configuration/internal/controltower"
+	"github.com/PimpMyNines/AWS-Pullomi-Organization-Configuration/internal/organization"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )
 
