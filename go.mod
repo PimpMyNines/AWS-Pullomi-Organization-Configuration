@@ -1,4 +1,4 @@
-module AWS-Pullomi-Organization-Configuration
+module github.com/PimpMyNines/AWS-Pullomi-Organization-Configuration
 
 go 1.21
 
