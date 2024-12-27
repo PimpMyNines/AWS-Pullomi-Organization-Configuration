@@ -1,0 +1,7 @@
+name: AWS-Pullomi-Organization-Configuration
+description: A module to manage AWS Organizational Units
+runtime: go
+config:
+  pulumi:tags:
+    value:
+      pulumi:template: aws-go
