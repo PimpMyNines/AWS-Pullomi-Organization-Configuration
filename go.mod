@@ -1,4 +1,4 @@
-module aws-organizational-units
+module AWS-Pullomi-Organization-Configuration
 
 go 1.21
 
