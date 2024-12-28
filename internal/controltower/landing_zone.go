@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/PimpMyNines/AWS-Pullomi-Organization-Configuration/internal/config"
-	"github.com/PimpMyNines/AWS-Pullomi-Organization-Configuration/internal/organization"
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/cloudtrail"
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/cloudwatch"
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/iam"
@@ -16,30 +15,6 @@ import (
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/ssm"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )
-
-type LandingZoneManifest struct {
-	GovernedRegions       []string               `json:"governedRegions"`
-	OrganizationStructure map[string]interface{} `json:"organizationStructure"`
-	CentralizedLogging    struct {
-		AccountId      string `json:"accountId"`
-		CloudTrailRole string `json:"cloudTrailRole"`
-		Configurations struct {
-			LoggingBucket struct {
-				RetentionDays int `json:"retentionDays"`
-			} `json:"loggingBucket"`
-			AccessLoggingBucket struct {
-				RetentionDays int `json:"retentionDays"`
-			} `json:"accessLoggingBucket"`
-		} `json:"configurations"`
-		Enabled bool `json:"enabled"`
-	} `json:"centralizedLogging"`
-	SecurityRoles struct {
-		AccountId string `json:"accountId"`
-	} `json:"securityRoles"`
-	AccessManagement struct {
-		Enabled bool `json:"enabled"`
-	} `json:"accessManagement"`
-}
 
 func createControlTowerRoles(ctx *pulumi.Context, tags map[string]string) error {
 	// Create AWSControlTowerAdmin role
@@ -130,24 +105,60 @@ func createControlTowerRoles(ctx *pulumi.Context, tags map[string]string) error 
 	return err
 }
 
-func createLandingZoneManifest(config *config.LandingZoneConfig, org *organization.OrganizationSetup) (*LandingZoneManifest, error) {
-	manifest := &LandingZoneManifest{
-		GovernedRegions: config.GovernedRegions,
-		OrganizationStructure: map[string]interface{}{
-			"security": map[string]string{
-				"name": "Security",
-			},
-			"sandbox": map[string]string{
-				"name": config.DefaultOUName,
-			},
-		},
-	}
+func createLandingZoneManifest(config *config.LandingZoneConfig, org *config.OrganizationSetup) (*config.LandingZoneConfig, error) {
+	// Create a copy of the config with all required fields
+	manifest := &config.LandingZoneConfig{
+		// Basic configurations
+		GovernedRegions:   config.GovernedRegions,
+		DefaultOUName:     config.DefaultOUName,
+		OrganizationUnits: config.OrganizationUnits,
+		LogBucketName:     config.LogBucketName,
+		LogRetentionDays:  config.LogRetentionDays,
+		Tags:              config.Tags,
 
-	manifest.CentralizedLogging.Enabled = true
-	manifest.CentralizedLogging.CloudTrailRole = config.CloudTrailRoleArn
-	manifest.CentralizedLogging.Configurations.LoggingBucket.RetentionDays = config.LogRetentionDays
-	manifest.CentralizedLogging.Configurations.AccessLoggingBucket.RetentionDays = config.LogRetentionDays
-	manifest.AccessManagement.Enabled = true
+		// Encryption configurations
+		KMSKeyAlias: config.KMSKeyAlias,
+		KMSKeyArn:   config.KMSKeyArn,
+		KMSKeyId:    config.KMSKeyId,
+
+		// Account configurations
+		AccountEmailDomain:  config.AccountEmailDomain,
+		ManagementAccountId: config.ManagementAccountId,
+		LogArchiveAccountId: config.LogArchiveAccountId,
+		AuditAccountId:      config.AuditAccountId,
+		SecurityAccountId:   config.SecurityAccountId,
+
+		// Control Tower configurations
+		CloudTrailRoleArn:   config.CloudTrailRoleArn,
+		EnabledGuardrails:   config.EnabledGuardrails,
+		HomeRegion:          config.HomeRegion,
+		AllowedRegions:      config.AllowedRegions,
+		ManagementRoleArn:   config.ManagementRoleArn,
+		StackSetRoleArn:     config.StackSetRoleArn,
+		CloudWatchRoleArn:   config.CloudWatchRoleArn,
+		VPCFlowLogsRoleArn:  config.VPCFlowLogsRoleArn,
+		OrganizationRoleArn: config.OrganizationRoleArn,
+
+		// Logging configurations
+		CloudWatchLogGroup:     config.CloudWatchLogGroup,
+		CloudTrailLogGroup:     config.CloudTrailLogGroup,
+		CloudTrailBucketRegion: config.CloudTrailBucketRegion,
+		AccessLogBucketName:    config.AccessLogBucketName,
+		FlowLogBucketName:      config.FlowLogBucketName,
+
+		// Network configurations
+		VPCSettings: config.VPCSettings,
+
+		// Security configurations
+		RequireMFA:         config.RequireMFA,
+		EnableSSLRequests:  config.EnableSSLRequests,
+		EnableSecurityHub:  config.EnableSecurityHub,
+		EnableGuardDuty:    config.EnableGuardDuty,
+		EnableConfig:       config.EnableConfig,
+		EnableCloudTrail:   config.EnableCloudTrail,
+		AllowedIPRanges:    config.AllowedIPRanges,
+		RestrictedServices: config.RestrictedServices,
+	}
 
 	return manifest, nil
 }
@@ -266,59 +277,59 @@ func ConfigureLogging(ctx *pulumi.Context, config *config.LandingZoneConfig) err
 	return err
 }
 
-func SetupLandingZone(ctx *pulumi.Context, org *organization.OrganizationSetup, config *config.LandingZoneConfig) error {
-	keyPolicy := pulumi.String(fmt.Sprintf(`{
-		"Version": "2012-10-17",
-		"Statement": [
-			{
-				"Sid": "Enable IAM User Permissions",
-				"Effect": "Allow",
-				"Principal": {
-					"AWS": "arn:aws:iam::%s:root"
-				},
-				"Action": "kms:*",
-				"Resource": "*"
-			},
-			{
-				"Sid": "Allow CloudTrail to encrypt logs",
-				"Effect": "Allow",
-				"Principal": {
-					"Service": "cloudtrail.amazonaws.com"
-				},
-				"Action": [
-					"kms:GenerateDataKey*",
-					"kms:Decrypt"
-				],
-				"Resource": "*"
-			},
-			{
-				"Sid": "Allow CloudWatch Logs to encrypt logs",
-				"Effect": "Allow",
-				"Principal": {
-					"Service": "logs.amazonaws.com"
-				},
-				"Action": [
-					"kms:Encrypt*",
-					"kms:Decrypt*",
-					"kms:ReEncrypt*",
-					"kms:GenerateDataKey*",
-					"kms:Describe*"
-				],
-				"Resource": "*"
-			}
-		]
-	}`, config.ManagementAccountId))
-
+func SetupLandingZone(ctx *pulumi.Context, org *config.OrganizationSetup, config *config.LandingZoneConfig) error {
+	// Create the KMS key
 	key, err := kms.NewKey(ctx, "controltower-key", &kms.KeyArgs{
 		Description:       pulumi.String("KMS key for Control Tower"),
 		EnableKeyRotation: pulumi.Bool(true),
-		Policy:            keyPolicy,
-		Tags:              pulumi.ToStringMap(config.Tags),
+		Policy: pulumi.String(fmt.Sprintf(`{
+			"Version": "2012-10-17",
+			"Statement": [
+				{
+					"Sid": "Enable IAM User Permissions",
+					"Effect": "Allow",
+					"Principal": {
+						"AWS": "arn:aws:iam::%s:root"
+					},
+					"Action": "kms:*",
+					"Resource": "*"
+				},
+				{
+					"Sid": "Allow CloudTrail to encrypt logs",
+					"Effect": "Allow",
+					"Principal": {
+						"Service": "cloudtrail.amazonaws.com"
+					},
+					"Action": [
+						"kms:GenerateDataKey*",
+						"kms:Decrypt"
+					],
+					"Resource": "*"
+				},
+				{
+					"Sid": "Allow CloudWatch Logs to encrypt logs",
+					"Effect": "Allow",
+					"Principal": {
+						"Service": "logs.amazonaws.com"
+					},
+					"Action": [
+						"kms:Encrypt*",
+						"kms:Decrypt*",
+						"kms:ReEncrypt*",
+						"kms:GenerateDataKey*",
+						"kms:Describe*"
+					],
+					"Resource": "*"
+				}
+			]
+		}`, config.ManagementAccountId)),
+		Tags: pulumi.ToStringMap(config.Tags),
 	})
 	if err != nil {
 		return err
 	}
 
+	// Create the alias
 	_, err = kms.NewAlias(ctx, "controltower-key-alias", &kms.AliasArgs{
 		Name:        pulumi.String(config.KMSKeyAlias),
 		TargetKeyId: key.ID(),
@@ -327,10 +338,11 @@ func SetupLandingZone(ctx *pulumi.Context, org *organization.OrganizationSetup, 
 		return err
 	}
 
-	// Store the KMS key ARN in the config
-	config.KMSKeyArn = key.Arn.ToStringOutput().ApplyT(func(arn string) string {
-		return arn
-	}).(pulumi.StringOutput).ToStringPtrOutput().Elem().String()
+	// Store the KMS key ARN in the config using ApplyT
+	key.Arn.ApplyT(func(arn string) error {
+		config.KMSKeyArn = arn
+		return nil
+	})
 
 	if err = createControlTowerRoles(ctx, config.Tags); err != nil {
 		return err

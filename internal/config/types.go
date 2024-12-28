@@ -4,6 +4,40 @@
 
 package config
 
+import (
+	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/organizations"
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+)
+
+type OrganizationConfig struct {
+	AWSProfile        string
+	LandingZoneConfig *LandingZoneConfig
+}
+
+type OrganizationSetup struct {
+	Org           *organizations.Organization
+	SecurityOU    *organizations.OrganizationalUnit
+	DefaultOU     *organizations.OrganizationalUnit
+	AdditionalOUs map[string]*organizations.OrganizationalUnit
+	RootId        pulumi.StringOutput
+	cleanup       []func() error
+}
+
+type OUInfo struct {
+	Id   string `json:"id"`
+	Arn  string `json:"arn"`
+	Name string `json:"name"`
+}
+
+type OrganizationInfo struct {
+	Id            string            `json:"id"`
+	Arn           string            `json:"arn"`
+	RootId        string            `json:"rootId"`
+	DefaultOUId   string            `json:"defaultOUId"`
+	SecurityOUId  string            `json:"securityOUId"`
+	AdditionalOUs map[string]OUInfo `json:"additionalOUs"`
+}
+
 // OUConfig defines the structure for an Organizational Unit
 type OUConfig struct {
 	Name     string               `json:"name"`               // Name of the OU
@@ -145,4 +179,14 @@ var DefaultConfig = LandingZoneConfig{
 			},
 		},
 	},
+}
+
+func (o *OrganizationSetup) Cleanup() error {
+	var lastErr error
+	for _, cleanup := range o.cleanup {
+		if err := cleanup(); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
 }
