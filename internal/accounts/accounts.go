@@ -16,9 +16,8 @@ import (
 
 	"github.com/PimpMyNines/AWS-Pullomi-Organization-Configuration/internal/config"
 	"github.com/PimpMyNines/AWS-Pullomi-Organization-Configuration/internal/metrics"
-	"github.com/aws/aws-sdk-go-v2/service/organizations"
 	awsOrg "github.com/pulumi/pulumi-aws/sdk/v6/go/aws/organizations"
-	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/ssm"
+	awsssm "github.com/pulumi/pulumi-aws/sdk/v6/go/aws/ssm"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
@@ -187,9 +186,9 @@ func (am *AccountManager) validateAccountConfig(config *AccountConfig) error {
 
 // storeAccountInfo stores account information in SSM Parameter Store
 func (am *AccountManager) storeAccountInfo(ctx *pulumi.Context, account *awsOrg.Account, config *AccountConfig) error {
-	_, err := ssm.NewParameter(ctx, fmt.Sprintf(ssmAccountPathFmt, config.Name), &ssm.ParameterArgs{
+	_, err := awsssm.NewParameter(ctx, fmt.Sprintf(ssmAccountPathFmt, config.Name), &awsssm.ParameterArgs{
 		Type: pulumi.String("SecureString"),
-		Value: pulumi.All(account.Id, account.Arn).ApplyT(func(args []interface{}) (string, error) {
+		Value: pulumi.All(account.ID(), account.Arn).ApplyT(func(args []interface{}) (string, error) {
 			info := AccountInfo{
 				ID:     args[0].(string),
 				ARN:    args[1].(string),
@@ -212,7 +211,7 @@ func (am *AccountManager) storeAccountInfo(ctx *pulumi.Context, account *awsOrg.
 }
 
 // CreateDefaultAccounts creates the default accounts required for AWS Control Tower
-func CreateDefaultAccounts(ctx *pulumi.Context, securityOUID pulumi.StringInput, cfg *config.LandingZoneConfig) error {
+func CreateDefaultAccounts(ctx *pulumi.Context, securityOUID pulumi.StringInput, cfg *config.OrganizationConfig) error {
 	am, err := NewAccountManager(ctx.Context())
 	if err != nil {
 		return err
@@ -262,12 +261,54 @@ func retryWithBackoff(operation func() error, maxAttempts int, baseDelay time.Du
 	return fmt.Errorf("operation failed after %d attempts: %w", maxAttempts, lastErr)
 }
 
+// BackupInfo represents the structure of a backup
+type BackupInfo struct {
+	ID        string                  `json:"id"`
+	Timestamp time.Time               `json:"timestamp"`
+	Accounts  map[string]*AccountInfo `json:"accounts"`
+}
+
 // Backup creates a backup of account configurations
 func (am *AccountManager) Backup(ctx context.Context) error {
 	am.mutex.RLock()
 	defer am.mutex.RUnlock()
 
-	// Implementation for backup functionality
+	backupInfo := BackupInfo{
+		ID:        fmt.Sprintf("backup-%s", time.Now().Format("20060102-150405")),
+		Timestamp: time.Now(),
+		Accounts:  am.accounts,
+	}
+
+	backupData, err := json.Marshal(backupInfo)
+	if err != nil {
+		return fmt.Errorf("failed to marshal backup data: %w", err)
+	}
+
+	pulumiCtx := getPulumiContextFromContext(ctx)
+	if pulumiCtx == nil {
+		return fmt.Errorf("pulumi context not found in context")
+	}
+
+	_, err = awsssm.NewParameter(pulumiCtx,
+		fmt.Sprintf("backup-%s", backupInfo.ID),
+		&awsssm.ParameterArgs{
+			Name:        pulumi.String(fmt.Sprintf("/organization/backups/%s", backupInfo.ID)),
+			Type:        pulumi.String("SecureString"),
+			Value:       pulumi.String(string(backupData)),
+			Description: pulumi.String(fmt.Sprintf("Account configuration backup created at %s", backupInfo.Timestamp)),
+		},
+		pulumi.DeleteBeforeReplace(true),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to store backup in SSM: %w", err)
+	}
+
+	am.logger.Info("backup created successfully",
+		zap.String("backupID", backupInfo.ID),
+		zap.Time("timestamp", backupInfo.Timestamp),
+		zap.Int("accountCount", len(backupInfo.Accounts)))
+
+	am.metrics.IncrementCounter("backups_created")
 	return nil
 }
 
@@ -276,6 +317,55 @@ func (am *AccountManager) Restore(ctx context.Context, backupID string) error {
 	am.mutex.Lock()
 	defer am.mutex.Unlock()
 
-	// Implementation for restore functionality
+	pulumiCtx := getPulumiContextFromContext(ctx)
+	if pulumiCtx == nil {
+		return fmt.Errorf("pulumi context not found in context")
+	}
+
+	// Changed this line to use pulumiCtx instead of ctx
+	paramValue, err := awsssm.LookupParameter(pulumiCtx, &awsssm.LookupParameterArgs{
+		Name:           fmt.Sprintf("/organization/backups/%s", backupID),
+		WithDecryption: pulumi.BoolRef(true),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to retrieve backup %s: %w", backupID, err)
+	}
+
+	var backupInfo BackupInfo
+	if err := json.Unmarshal([]byte(paramValue.Value), &backupInfo); err != nil {
+		return fmt.Errorf("failed to unmarshal backup data: %w", err)
+	}
+
+	if backupInfo.Accounts == nil {
+		return fmt.Errorf("invalid backup data: accounts map is nil")
+	}
+
+	am.accounts = make(map[string]*AccountInfo)
+	for id, account := range backupInfo.Accounts {
+		am.accounts[id] = account
+	}
+
+	am.logger.Info("restore completed successfully",
+		zap.String("backupID", backupID),
+		zap.Time("backupTimestamp", backupInfo.Timestamp),
+		zap.Int("restoredAccounts", len(backupInfo.Accounts)))
+
+	am.metrics.IncrementCounter("backups_restored")
 	return nil
+}
+
+// Helper function to get Pulumi context from context.Context
+func getPulumiContextFromContext(ctx context.Context) *pulumi.Context {
+	if ctx == nil {
+		return nil
+	}
+	if pulumiCtx, ok := ctx.Value("pulumi.Context").(*pulumi.Context); ok {
+		return pulumiCtx
+	}
+	return nil
+}
+
+// Add this to your AccountManager struct
+func (am *AccountManager) WithPulumiContext(ctx *pulumi.Context) context.Context {
+	return context.WithValue(context.Background(), "pulumi.Context", ctx)
 }

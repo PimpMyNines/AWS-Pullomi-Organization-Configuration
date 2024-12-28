@@ -1,9 +1,9 @@
 package main
 
 import (
-	"github.com/pimpmynine/aws-controltower-module/internal/controltower"
-	"github.com/pimpmynine/aws-controltower-module/internal/organization"
-	"github.com/pimpmynines/aws-controltower-module/internal/config"
+	"github.com/PimpMyNines/AWS-Pullomi-Organization-Configuration/internal/config"
+	"github.com/PimpMyNines/AWS-Pullomi-Organization-Configuration/internal/controltower"
+	"github.com/PimpMyNines/AWS-Pullomi-Organization-Configuration/internal/organization"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )
 

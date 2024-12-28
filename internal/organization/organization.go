@@ -8,16 +8,13 @@ package organization
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/PimpMyNines/AWS-Pullomi-Organization-Configuration/internal/config"
 	"github.com/PimpMyNines/AWS-Pullomi-Organization-Configuration/internal/metrics"
-	"github.com/aws/aws-sdk-go-v2/service/organizations"
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/organizations"
-	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/ssm"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
@@ -119,10 +116,6 @@ func (o *Organization) initialize(ctx *pulumi.Context, cfg *config.OrganizationC
 		return err
 	}
 
-	if err := o.storeOrganizationInfo(ctx, cfg); err != nil {
-		return err
-	}
-
 	return nil
 }
 
@@ -155,7 +148,7 @@ func (o *Organization) createOrganization(ctx *pulumi.Context, cfg *config.Organ
 	}
 
 	o.org = org
-	o.rootId = org.Roots.Index(pulumi.Int(0)).Id()
+	o.rootId = org.Roots.Index(pulumi.Int(0)).Id().ToStringOutput()
 
 	o.logger.Info("organization created successfully")
 	o.metrics.IncrementCounter("organization_created")
@@ -179,8 +172,18 @@ func (o *Organization) createOUs(ctx *pulumi.Context, cfg *config.OrganizationCo
 		return err
 	}
 
-	// Create additional OUs
-	return o.createAdditionalOUs(ctx, cfg)
+	// Create additional OUs if configured
+	if cfg.LandingZoneConfig.AdditionalOUs != nil {
+		for name, ouConfig := range cfg.LandingZoneConfig.AdditionalOUs {
+			ou, err := o.createOU(ctx, name, o.rootId, pulumi.ToStringMap(cfg.LandingZoneConfig.Tags))
+			if err != nil {
+				return fmt.Errorf("failed to create additional OU %s: %w", name, err)
+			}
+			o.additionalOUs[name] = ou
+		}
+	}
+
+	return nil
 }
 
 // createOU creates an organizational unit with retry logic

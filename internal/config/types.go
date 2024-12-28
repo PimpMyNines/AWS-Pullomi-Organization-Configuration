@@ -20,34 +20,42 @@ import (
 
 // State-related types and constants
 const (
-	stateTableName    = "aws-organization-state"
-	stateBackupBucket = "aws-organization-state-backups"
-	stateFilePrefix   = "state"
-	backupFilePrefix  = "backup"
+	// Change from private to public constants
+	StateTableName    = "aws-organization-state"
+	StateBackupBucket = "aws-organization-state-backups"
+	StateFilePrefix   = "state"
+	BackupFilePrefix  = "backup"
 
-	stateExpiryDays     = 30
-	backupRetentionDays = 90
-	defaultTimeout      = 30 * time.Second
-	maxRetries          = 3
-	initialBackoff      = time.Second
+	StateExpiryDays     = 30
+	BackupRetentionDays = 90
+	DefaultTimeout      = 30 * time.Second
+	MaxRetries          = 3
+	InitialBackoff      = time.Second
 
 	// DynamoDB attributes
-	pkAttribute      = "pk"
-	skAttribute      = "sk"
-	stateAttribute   = "state"
-	versionAttribute = "version"
+	PkAttribute      = "pk"
+	SkAttribute      = "sk"
+	StateAttribute   = "state"
+	VersionAttribute = "version"
 )
 
 // StateData represents the structure of stored state
 type StateData struct {
-	Version     string                 `json:"version"`
-	Timestamp   time.Time              `json:"timestamp"`
-	State       map[string]interface{} `json:"state"`
-	Component   string                 `json:"component"`
-	Tags        map[string]string      `json:"tags,omitempty"`
-	UpdatedBy   string                 `json:"updatedBy,omitempty"`
-	BackupID    string                 `json:"backupId,omitempty"`
-	Description string                 `json:"description,omitempty"`
+	Version           string                 `json:"version"`
+	Timestamp         time.Time              `json:"timestamp"`
+	State             map[string]interface{} `json:"state"`
+	StateTableName    string                 `json:"stateTableName"`
+	StateBackupBucket string                 `json:"stateBackupBucket"`
+	StateFilePrefix   string                 `json:"stateFilePrefix"`
+	Component         string                 `json:"component"`
+	Tags              map[string]string      `json:"tags,omitempty"`
+	UpdatedBy         string                 `json:"updatedBy,omitempty"`
+	BackupID          string                 `json:"backupId,omitempty"`
+	Description       string                 `json:"description,omitempty"`
+	DefaultTimeout    time.Duration          `json:"defaultTimeout,omitempty"`
+	MaxRetries        int                    `json:"maxRetries,omitempty"`
+	InitialBackoff    time.Duration          `json:"initialBackoff,omitempty"`
+	BackupFilePrefix  string                 `json:"backupFilePrefix,omitempty"`
 }
 
 // StateError represents a state operation error
@@ -71,11 +79,11 @@ const (
 
 // Validation constants
 const (
-	minLogRetentionDays = 7
-	maxLogRetentionDays = 3653
-	minNameLength       = 3
-	maxNameLength       = 128
-	emailRegexPattern   = `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
+	MinLogRetentionDays = 7
+	MaxLogRetentionDays = 3653
+	MinNameLength       = 3
+	MaxNameLength       = 128
+	EmailRegexPattern   = `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
 )
 
 // ConfigurationManager handles configuration operations
@@ -91,7 +99,7 @@ type ConfigurationManager interface {
 type OrganizationConfig struct {
 	Version           string             `json:"version"`
 	AWSProfile        string             `json:"awsProfile"`
-	LandingZoneConfig *LandingZoneConfig `json:"landingZoneConfig"`
+	LandingZoneConfig *LandingZoneConfig `json:"LandingZoneConfig"`
 	logger            *zap.Logger
 	metrics           *metrics.Collector
 	mutex             sync.RWMutex
@@ -207,10 +215,10 @@ func (c *OrganizationConfig) validateBasicConfig() error {
 		return fmt.Errorf("at least one governed region is required")
 	}
 
-	if c.LandingZoneConfig.LogRetentionDays < minLogRetentionDays ||
-		c.LandingZoneConfig.LogRetentionDays > maxLogRetentionDays {
+	if c.LandingZoneConfig.LogRetentionDays < MinLogRetentionDays ||
+		c.LandingZoneConfig.LogRetentionDays > MaxLogRetentionDays {
 		return fmt.Errorf("log retention days must be between %d and %d",
-			minLogRetentionDays, maxLogRetentionDays)
+			MinLogRetentionDays, MaxLogRetentionDays)
 	}
 
 	return nil
@@ -218,7 +226,7 @@ func (c *OrganizationConfig) validateBasicConfig() error {
 
 // validateAccountConfig validates account-related configurations
 func (c *OrganizationConfig) validateAccountConfig() error {
-	emailRegex := regexp.MustCompile(emailRegexPattern)
+	emailRegex := regexp.MustCompile(EmailRegexPattern)
 	if !emailRegex.MatchString(c.LandingZoneConfig.AccountEmailDomain) {
 		return fmt.Errorf("invalid account email domain")
 	}

@@ -93,9 +93,16 @@ func (sm *StateManager) Save(ctx context.Context, state interface{}) error {
 	}()
 
 	stateData := &config.StateData{
-		Version:   config.ConfigVersion,
-		Timestamp: time.Now(),
-		Component: "aws-organization",
+		Version:           config.ConfigVersion,
+		Timestamp:         time.Now(),
+		Component:         "aws-organization",
+		StateTableName:    config.StateTableName,
+		StateBackupBucket: config.StateBackupBucket,
+		StateFilePrefix:   config.StateFilePrefix,
+		BackupFilePrefix:  config.BackupFilePrefix,
+		DefaultTimeout:    config.DefaultTimeout,
+		MaxRetries:        config.MaxRetries,
+		InitialBackoff:    config.InitialBackoff,
 		Tags: map[string]string{
 			"service": "organization-config",
 		},
