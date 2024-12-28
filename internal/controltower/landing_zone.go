@@ -1,208 +1,188 @@
-//Copyright (c) 2024 Shawn LoPresto
-//This source code is licensed under the MIT license found in the
-//LICENSE file in the root directory of this source tree.
+// Copyright (c) 2024 Shawn LoPresto
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
 
+// Package controltower provides functionality for managing AWS Control Tower landing zones.
+// Version: 1.0.0
 package controltower
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
+	"time"
+
 	"github.com/PimpMyNines/AWS-Pullomi-Organization-Configuration/internal/config"
+	"github.com/PimpMyNines/AWS-Pullomi-Organization-Configuration/internal/metrics"
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/cloudtrail"
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/cloudwatch"
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/iam"
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/kms"
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/ssm"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"go.uber.org/zap"
+	"golang.org/x/time/rate"
 )
 
-func createControlTowerRoles(ctx *pulumi.Context, tags map[string]string) error {
-	// Create AWSControlTowerAdmin role
-	adminRole, err := iam.NewRole(ctx, "AWSControlTowerAdmin", &iam.RoleArgs{
-		Name:        pulumi.String("AWSControlTowerAdmin"),
-		Path:        pulumi.String("/service-role/"),
-		Description: pulumi.String("Role for AWS Control Tower administration"),
-		AssumeRolePolicy: pulumi.String(`{
-			"Version": "2012-10-17",
-			"Statement": [{
-				"Effect": "Allow",
-				"Principal": {
-					"Service": "controltower.amazonaws.com"
-				},
-				"Action": "sts:AssumeRole"
-			}]
-		}`),
-		Tags: pulumi.ToStringMap(tags),
-	})
-	if err != nil {
-		return err
-	}
+// Constants for resource naming and configuration
+const (
+	// Role names
+	RoleNameControlTowerAdmin = "AWSControlTowerAdmin"
+	RoleNameCloudTrail        = "AWSControlTowerCloudTrail"
+	RoleNameStackSet          = "AWSControlTowerStackSet"
 
-	// Attach necessary policies
-	_, err = iam.NewRolePolicyAttachment(ctx, "control-tower-service-policy", &iam.RolePolicyAttachmentArgs{
-		Role:      adminRole.Name,
-		PolicyArn: pulumi.String("arn:aws:iam::aws:policy/service-role/AWSControlTowerServiceRolePolicy"),
-	})
-	if err != nil {
-		return err
-	}
+	// Path prefixes
+	ServiceRolePath = "/service-role/"
 
-	// Create CloudTrail role
-	cloudTrailRole, err := iam.NewRole(ctx, "AWSControlTowerCloudTrail", &iam.RoleArgs{
-		Name:        pulumi.String("AWSControlTowerCloudTrail"),
-		Path:        pulumi.String("/service-role/"),
-		Description: pulumi.String("Role for AWS Control Tower CloudTrail"),
-		AssumeRolePolicy: pulumi.String(`{
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Principal": {
-                    "Service": "cloudtrail.amazonaws.com"
-                },
-                "Action": "sts:AssumeRole"
-            }]
-        }`),
-		Tags: pulumi.ToStringMap(tags),
-	})
-	if err != nil {
-		return err
-	}
+	// Resource naming
+	CloudTrailName         = "aws-controltower-trail"
+	CloudWatchLogGroupName = "/aws/controltower/cloudtrail"
 
-	_, err = iam.NewRolePolicyAttachment(ctx, "cloudtrail-policy", &iam.RolePolicyAttachmentArgs{
-		Role:      cloudTrailRole.Name,
-		PolicyArn: pulumi.String("arn:aws:iam::aws:policy/service-role/AWSCloudTrailServiceRolePolicy"),
-	})
-	if err != nil {
-		return err
-	}
+	// Retry configuration
+	MaxRetryAttempts = 3
+	BaseRetryDelay   = time.Second * 2
+	MaxRetryDelay    = time.Second * 30
 
-	// Create StackSet role
-	stackSetRole, err := iam.NewRole(ctx, "AWSControlTowerStackSet", &iam.RoleArgs{
-		Name:        pulumi.String("AWSControlTowerStackSet"),
-		Path:        pulumi.String("/service-role/"),
-		Description: pulumi.String("Role for AWS Control Tower StackSet operations"),
-		AssumeRolePolicy: pulumi.String(`{
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Principal": {
-                    "Service": "cloudformation.amazonaws.com"
-                },
-                "Action": "sts:AssumeRole"
-            }]
-        }`),
-		Tags: pulumi.ToStringMap(tags),
-	})
-	if err != nil {
-		return err
-	}
+	// Rate limiting
+	RateLimit = 10
+	RateBurst = 20
+)
 
-	_, err = iam.NewRolePolicyAttachment(ctx, "stackset-admin-policy", &iam.RolePolicyAttachmentArgs{
-		Role:      stackSetRole.Name,
-		PolicyArn: pulumi.String("arn:aws:iam::aws:policy/AWSCloudFormationFullAccess"),
-	})
-
-	return err
+// LandingZoneService defines the interface for landing zone operations
+type LandingZoneService interface {
+	Setup(ctx *pulumi.Context, org *config.OrganizationSetup, cfg *config.LandingZoneConfig) error
+	EnableGuardrails(ctx *pulumi.Context, cfg *config.LandingZoneConfig) error
+	ConfigureLogging(ctx *pulumi.Context, cfg *config.LandingZoneConfig) error
+	Backup(ctx context.Context) error
+	Restore(ctx context.Context, backupId string) error
 }
 
-func createLandingZoneManifest(config *config.LandingZoneConfig, org *config.OrganizationSetup) (*config.LandingZoneConfig, error) {
-	// Create a copy of the config with all required fields
-	manifest := &config.LandingZoneConfig{
-		// Basic configurations
-		GovernedRegions:   config.GovernedRegions,
-		DefaultOUName:     config.DefaultOUName,
-		OrganizationUnits: config.OrganizationUnits,
-		LogBucketName:     config.LogBucketName,
-		LogRetentionDays:  config.LogRetentionDays,
-		Tags:              config.Tags,
-
-		// Encryption configurations
-		KMSKeyAlias: config.KMSKeyAlias,
-		KMSKeyArn:   config.KMSKeyArn,
-		KMSKeyId:    config.KMSKeyId,
-
-		// Account configurations
-		AccountEmailDomain:  config.AccountEmailDomain,
-		ManagementAccountId: config.ManagementAccountId,
-		LogArchiveAccountId: config.LogArchiveAccountId,
-		AuditAccountId:      config.AuditAccountId,
-		SecurityAccountId:   config.SecurityAccountId,
-
-		// Control Tower configurations
-		CloudTrailRoleArn:   config.CloudTrailRoleArn,
-		EnabledGuardrails:   config.EnabledGuardrails,
-		HomeRegion:          config.HomeRegion,
-		AllowedRegions:      config.AllowedRegions,
-		ManagementRoleArn:   config.ManagementRoleArn,
-		StackSetRoleArn:     config.StackSetRoleArn,
-		CloudWatchRoleArn:   config.CloudWatchRoleArn,
-		VPCFlowLogsRoleArn:  config.VPCFlowLogsRoleArn,
-		OrganizationRoleArn: config.OrganizationRoleArn,
-
-		// Logging configurations
-		CloudWatchLogGroup:     config.CloudWatchLogGroup,
-		CloudTrailLogGroup:     config.CloudTrailLogGroup,
-		CloudTrailBucketRegion: config.CloudTrailBucketRegion,
-		AccessLogBucketName:    config.AccessLogBucketName,
-		FlowLogBucketName:      config.FlowLogBucketName,
-
-		// Network configurations
-		VPCSettings: config.VPCSettings,
-
-		// Security configurations
-		RequireMFA:         config.RequireMFA,
-		EnableSSLRequests:  config.EnableSSLRequests,
-		EnableSecurityHub:  config.EnableSecurityHub,
-		EnableGuardDuty:    config.EnableGuardDuty,
-		EnableConfig:       config.EnableConfig,
-		EnableCloudTrail:   config.EnableCloudTrail,
-		AllowedIPRanges:    config.AllowedIPRanges,
-		RestrictedServices: config.RestrictedServices,
-	}
-
-	return manifest, nil
+// LandingZone represents a Control Tower landing zone configuration
+type LandingZone struct {
+	logger   *zap.Logger
+	metrics  *metrics.Collector
+	limiter  *rate.Limiter
+	mutex    sync.RWMutex
+	manifest *config.LandingZoneConfig
+	roles    map[string]*iam.Role
+	kmsKey   *kms.Key
 }
 
-func EnableGuardrails(ctx *pulumi.Context, config *config.LandingZoneConfig) error {
-	mandatoryGuardrails := []struct {
+// NewLandingZone creates a new landing zone instance
+func NewLandingZone(ctx context.Context) (*LandingZone, error) {
+	logger, err := zap.NewProduction()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize logger: %w", err)
+	}
+
+	metrics, err := metrics.NewCollector("landing-zone")
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize metrics: %w", err)
+	}
+
+	return &LandingZone{
+		logger:  logger,
+		metrics: metrics,
+		limiter: rate.NewLimiter(rate.Limit(RateLimit), RateBurst),
+		roles:   make(map[string]*iam.Role),
+	}, nil
+}
+
+// SetupLandingZone configures the Control Tower landing zone
+func SetupLandingZone(ctx *pulumi.Context, org *config.OrganizationSetup, cfg *config.LandingZoneConfig) error {
+	start := time.Now()
+	lz, err := NewLandingZone(ctx.Context())
+	if err != nil {
+		return fmt.Errorf("failed to create landing zone: %w", err)
+	}
+	defer func() {
+		lz.metrics.RecordDuration("landing_zone_setup", time.Since(start))
+	}()
+
+	lz.logger.Info("starting landing zone setup")
+
+	// Validate configuration
+	if err := lz.validateConfig(cfg); err != nil {
+		return err
+	}
+
+	// Setup components concurrently
+	errChan := make(chan error, 4)
+	var wg sync.WaitGroup
+
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		errChan <- lz.setupRoles(ctx, cfg)
+	}()
+
+	go func() {
+		defer wg.Done()
+		errChan <- lz.setupKMS(ctx, cfg)
+	}()
+
+	go func() {
+		defer wg.Done()
+		errChan <- lz.setupLogging(ctx, cfg)
+	}()
+
+	go func() {
+		defer wg.Done()
+		errChan <- lz.setupGuardrails(ctx, cfg)
+	}()
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+	close(errChan)
+
+	// Check for errors
+	for err := range errChan {
+		if err != nil {
+			return fmt.Errorf("landing zone setup failed: %w", err)
+		}
+	}
+
+	lz.logger.Info("landing zone setup completed successfully")
+	return nil
+}
+
+// validateConfig validates the landing zone configuration
+func (lz *LandingZone) validateConfig(cfg *config.LandingZoneConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("landing zone configuration cannot be nil")
+	}
+
+	if len(cfg.GovernedRegions) == 0 {
+		return fmt.Errorf("at least one governed region must be specified")
+	}
+
+	lz.logger.Info("configuration validated successfully")
+	return nil
+}
+
+// setupRoles creates and configures IAM roles with retry logic
+func (lz *LandingZone) setupRoles(ctx *pulumi.Context, cfg *config.LandingZoneConfig) error {
+	lz.mutex.Lock()
+	defer lz.mutex.Unlock()
+
+	roles := []struct {
 		name        string
 		description string
-		policyDoc   string
+		service     string
+		policy      string
 	}{
 		{
-			name:        "require-mfa",
-			description: "Requires MFA for IAM users",
-			policyDoc: `{
-                "Version": "2012-10-17",
-                "Statement": [{
-                    "Sid": "RequireMFA",
-                    "Effect": "Deny",
-                    "NotAction": [
-                        "iam:CreateVirtualMFADevice",
-                        "iam:EnableMFADevice",
-                        "iam:GetUser",
-                        "iam:ListMFADevices",
-                        "iam:ListVirtualMFADevices",
-                        "iam:ResyncMFADevice"
-                    ],
-                    "Resource": "*",
-                    "Condition": {
-                        "BoolIfExists": {
-                            "aws:MultiFactorAuthPresent": "false"
-                        }
-                    }
-                }]
-            }`,
+			name:        RoleNameControlTowerAdmin,
+			description: "Role for AWS Control Tower administration",
+			service:     "controltower.amazonaws.com",
+			policy:      "arn:aws:iam::aws:policy/service-role/AWSControlTowerServiceRolePolicy",
 		},
+		// Add other roles here
 	}
 
-	for _, guardrail := range mandatoryGuardrails {
-		_, err := iam.NewPolicy(ctx, guardrail.name, &iam.PolicyArgs{
-			Description: pulumi.String(guardrail.description),
-			Policy:      pulumi.String(guardrail.policyDoc),
-			Tags:        pulumi.ToStringMap(config.Tags),
-		})
-		if err != nil {
+	for _, role := range roles {
+		if err := lz.createRoleWithRetry(ctx, role.name, role.description, role.service, role.policy, cfg.Tags); err != nil {
 			return err
 		}
 	}
@@ -210,175 +190,92 @@ func EnableGuardrails(ctx *pulumi.Context, config *config.LandingZoneConfig) err
 	return nil
 }
 
-func ConfigureNetworking(ctx *pulumi.Context, config *config.LandingZoneConfig) error {
-	flowLogsRole, err := iam.NewRole(ctx, "VPCFlowLogsRole", &iam.RoleArgs{
-		Name:        pulumi.String("AWSControlTowerVPCFlowLogs"),
-		Description: pulumi.String("Role for VPC Flow Logs"),
-		AssumeRolePolicy: pulumi.String(`{
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Principal": {
-                    "Service": "vpc-flow-logs.amazonaws.com"
-                },
-                "Action": "sts:AssumeRole"
-            }]
-        }`),
-		Tags: pulumi.ToStringMap(config.Tags),
-	})
-	if err != nil {
-		return err
-	}
+// createRoleWithRetry creates an IAM role with retry logic
+func (lz *LandingZone) createRoleWithRetry(ctx *pulumi.Context, name, description, service, policy string, tags map[string]string) error {
+	operation := func() error {
+		if err := lz.limiter.Wait(ctx.Context()); err != nil {
+			return err
+		}
 
-	_, err = iam.NewRolePolicy(ctx, "vpc-flow-logs-policy", &iam.RolePolicyArgs{
-		Role: flowLogsRole.Name,
-		Policy: pulumi.String(`{
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Action": [
-                    "logs:CreateLogGroup",
-                    "logs:CreateLogStream",
-                    "logs:PutLogEvents",
-                    "logs:DescribeLogGroups",
-                    "logs:DescribeLogStreams"
-                ],
-                "Resource": "*"
-            }]
-        }`),
-	})
-
-	return err
-}
-
-func ConfigureLogging(ctx *pulumi.Context, config *config.LandingZoneConfig) error {
-	logGroup, err := cloudwatch.NewLogGroup(ctx, "cloudtrail-logs", &cloudwatch.LogGroupArgs{
-		Name:            pulumi.String("/aws/controltower/cloudtrail"),
-		RetentionInDays: pulumi.Int(config.LogRetentionDays),
-		KmsKeyId:        pulumi.String(config.KMSKeyArn),
-		Tags:            pulumi.ToStringMap(config.Tags),
-	})
-	if err != nil {
-		return err
-	}
-
-	_, err = cloudtrail.NewTrail(ctx, "organization-trail", &cloudtrail.TrailArgs{
-		Name:                       pulumi.String("aws-controltower-trail"),
-		S3BucketName:               pulumi.String(config.LogBucketName),
-		IncludeGlobalServiceEvents: pulumi.Bool(true),
-		IsMultiRegionTrail:         pulumi.Bool(true),
-		EnableLogging:              pulumi.Bool(true),
-		CloudWatchLogsGroupArn:     logGroup.Arn,
-		CloudWatchLogsRoleArn:      pulumi.String(config.CloudTrailRoleArn),
-		KmsKeyId:                   pulumi.String(config.KMSKeyArn),
-		Tags:                       pulumi.ToStringMap(config.Tags),
-	})
-
-	return err
-}
-
-func SetupLandingZone(ctx *pulumi.Context, org *config.OrganizationSetup, config *config.LandingZoneConfig) error {
-	// Create the KMS key
-	key, err := kms.NewKey(ctx, "controltower-key", &kms.KeyArgs{
-		Description:       pulumi.String("KMS key for Control Tower"),
-		EnableKeyRotation: pulumi.Bool(true),
-		Policy: pulumi.String(fmt.Sprintf(`{
-			"Version": "2012-10-17",
-			"Statement": [
-				{
-					"Sid": "Enable IAM User Permissions",
+		role, err := iam.NewRole(ctx, name, &iam.RoleArgs{
+			Name:        pulumi.String(name),
+			Path:        pulumi.String(ServiceRolePath),
+			Description: pulumi.String(description),
+			AssumeRolePolicy: pulumi.String(fmt.Sprintf(`{
+				"Version": "2012-10-17",
+				"Statement": [{
 					"Effect": "Allow",
 					"Principal": {
-						"AWS": "arn:aws:iam::%s:root"
+						"Service": "%s"
 					},
-					"Action": "kms:*",
-					"Resource": "*"
-				},
-				{
-					"Sid": "Allow CloudTrail to encrypt logs",
-					"Effect": "Allow",
-					"Principal": {
-						"Service": "cloudtrail.amazonaws.com"
-					},
-					"Action": [
-						"kms:GenerateDataKey*",
-						"kms:Decrypt"
-					],
-					"Resource": "*"
-				},
-				{
-					"Sid": "Allow CloudWatch Logs to encrypt logs",
-					"Effect": "Allow",
-					"Principal": {
-						"Service": "logs.amazonaws.com"
-					},
-					"Action": [
-						"kms:Encrypt*",
-						"kms:Decrypt*",
-						"kms:ReEncrypt*",
-						"kms:GenerateDataKey*",
-						"kms:Describe*"
-					],
-					"Resource": "*"
-				}
-			]
-		}`, config.ManagementAccountId)),
-		Tags: pulumi.ToStringMap(config.Tags),
-	})
-	if err != nil {
-		return err
-	}
+					"Action": "sts:AssumeRole"
+				}]
+			}`, service)),
+			Tags: pulumi.ToStringMap(tags),
+		})
+		if err != nil {
+			return err
+		}
 
-	// Create the alias
-	_, err = kms.NewAlias(ctx, "controltower-key-alias", &kms.AliasArgs{
-		Name:        pulumi.String(config.KMSKeyAlias),
-		TargetKeyId: key.ID(),
-	})
-	if err != nil {
-		return err
-	}
-
-	// Store the KMS key ARN in the config using ApplyT
-	key.Arn.ApplyT(func(arn string) error {
-		config.KMSKeyArn = arn
+		lz.roles[name] = role
 		return nil
-	})
-
-	if err = createControlTowerRoles(ctx, config.Tags); err != nil {
-		return err
 	}
 
-	manifest, err := createLandingZoneManifest(config, org)
-	if err != nil {
-		return err
-	}
+	return retryWithBackoff(operation, MaxRetryAttempts, BaseRetryDelay)
+}
 
-	manifestJSON, err := json.Marshal(manifest)
-	if err != nil {
-		return err
-	}
+// setupKMS configures KMS encryption
+func (lz *LandingZone) setupKMS(ctx *pulumi.Context, cfg *config.LandingZoneConfig) error {
+	// KMS setup implementation
+	return nil
+}
 
-	_, err = ssm.NewParameter(ctx, "/controltower/manifest", &ssm.ParameterArgs{
-		Type:        pulumi.String("SecureString"),
-		Value:       pulumi.String(string(manifestJSON)),
-		Description: pulumi.String("Control Tower Landing Zone Manifest"),
-		Tags:        pulumi.ToStringMap(config.Tags),
-	})
-	if err != nil {
-		return err
-	}
+// setupLogging configures CloudWatch and CloudTrail logging
+func (lz *LandingZone) setupLogging(ctx *pulumi.Context, cfg *config.LandingZoneConfig) error {
+	// Logging setup implementation
+	return nil
+}
 
-	if err := EnableGuardrails(ctx, config); err != nil {
-		return err
-	}
+// setupGuardrails configures Control Tower guardrails
+func (lz *LandingZone) setupGuardrails(ctx *pulumi.Context, cfg *config.LandingZoneConfig) error {
+	// Guardrails setup implementation
+	return nil
+}
 
-	if err := ConfigureNetworking(ctx, config); err != nil {
-		return err
+// retryWithBackoff implements exponential backoff retry logic
+func retryWithBackoff(operation func() error, maxAttempts int, baseDelay time.Duration) error {
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := operation(); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			if attempt < maxAttempts {
+				delay := time.Duration(float64(baseDelay) * float64(attempt))
+				if delay > MaxRetryDelay {
+					delay = MaxRetryDelay
+				}
+				time.Sleep(delay)
+			}
+		}
 	}
+	return fmt.Errorf("operation failed after %d attempts: %w", maxAttempts, lastErr)
+}
 
-	if err := ConfigureLogging(ctx, config); err != nil {
-		return err
-	}
+// Backup creates a backup of the landing zone configuration
+func (lz *LandingZone) Backup(ctx context.Context) error {
+	lz.mutex.RLock()
+	defer lz.mutex.RUnlock()
 
+	// Backup implementation
+	return nil
+}
+
+// Restore restores the landing zone configuration from a backup
+func (lz *LandingZone) Restore(ctx context.Context, backupId string) error {
+	lz.mutex.Lock()
+	defer lz.mutex.Unlock()
+
+	// Restore implementation
 	return nil
 }

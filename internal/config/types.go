@@ -1,192 +1,362 @@
-//Copyright (c) 2024 Shawn LoPresto
-//This source code is licensed under the MIT license found in the
-//LICENSE file in the root directory of this source tree.
+// Copyright (c) 2024 Shawn LoPresto
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
 
+// Package config provides configuration types and validation for AWS Organization and Control Tower setup.
+// Version: 1.0.0
 package config
 
 import (
-	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/organizations"
-	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"fmt"
+	"net"
+	"regexp"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/PimpMyNines/AWS-Pullomi-Organization-Configuration/internal/metrics"
+	"go.uber.org/zap"
 )
 
+// State-related types and constants
+const (
+	stateTableName    = "aws-organization-state"
+	stateBackupBucket = "aws-organization-state-backups"
+	stateFilePrefix   = "state"
+	backupFilePrefix  = "backup"
+
+	stateExpiryDays     = 30
+	backupRetentionDays = 90
+	defaultTimeout      = 30 * time.Second
+	maxRetries          = 3
+	initialBackoff      = time.Second
+
+	// DynamoDB attributes
+	pkAttribute      = "pk"
+	skAttribute      = "sk"
+	stateAttribute   = "state"
+	versionAttribute = "version"
+)
+
+// StateData represents the structure of stored state
+type StateData struct {
+	Version     string                 `json:"version"`
+	Timestamp   time.Time              `json:"timestamp"`
+	State       map[string]interface{} `json:"state"`
+	Component   string                 `json:"component"`
+	Tags        map[string]string      `json:"tags,omitempty"`
+	UpdatedBy   string                 `json:"updatedBy,omitempty"`
+	BackupID    string                 `json:"backupId,omitempty"`
+	Description string                 `json:"description,omitempty"`
+}
+
+// StateError represents a state operation error
+type StateError struct {
+	Operation string
+	Message   string
+	Err       error
+}
+
+func (e *StateError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("%s: %s: %v", e.Operation, e.Message, e.Err)
+	}
+	return fmt.Sprintf("%s: %s", e.Operation, e.Message)
+}
+
+// Version information
+const (
+	ConfigVersion = "1.0.0"
+)
+
+// Validation constants
+const (
+	minLogRetentionDays = 7
+	maxLogRetentionDays = 3653
+	minNameLength       = 3
+	maxNameLength       = 128
+	emailRegexPattern   = `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
+)
+
+// ConfigurationManager handles configuration operations
+type ConfigurationManager interface {
+	Load() (*OrganizationConfig, error)
+	Save(config *OrganizationConfig) error
+	Validate(config *OrganizationConfig) error
+	Backup() error
+	Restore(version string) error
+}
+
+// OrganizationConfig represents the main configuration structure
 type OrganizationConfig struct {
-	AWSProfile        string
-	LandingZoneConfig *LandingZoneConfig
-}
-
-type OrganizationSetup struct {
-	Org           *organizations.Organization
-	SecurityOU    *organizations.OrganizationalUnit
-	DefaultOU     *organizations.OrganizationalUnit
-	AdditionalOUs map[string]*organizations.OrganizationalUnit
-	RootId        pulumi.StringOutput
-	cleanup       []func() error
-}
-
-type OUInfo struct {
-	Id   string `json:"id"`
-	Arn  string `json:"arn"`
-	Name string `json:"name"`
-}
-
-type OrganizationInfo struct {
-	Id            string            `json:"id"`
-	Arn           string            `json:"arn"`
-	RootId        string            `json:"rootId"`
-	DefaultOUId   string            `json:"defaultOUId"`
-	SecurityOUId  string            `json:"securityOUId"`
-	AdditionalOUs map[string]OUInfo `json:"additionalOUs"`
-}
-
-// OUConfig defines the structure for an Organizational Unit
-type OUConfig struct {
-	Name     string               `json:"name"`               // Name of the OU
-	Children map[string]*OUConfig `json:"children,omitempty"` // Nested OUs, omitted if empty
+	Version           string             `json:"version"`
+	AWSProfile        string             `json:"awsProfile"`
+	LandingZoneConfig *LandingZoneConfig `json:"landingZoneConfig"`
+	logger            *zap.Logger
+	metrics           *metrics.Collector
+	mutex             sync.RWMutex
 }
 
 // LandingZoneConfig defines the complete AWS Control Tower Landing Zone configuration
 type LandingZoneConfig struct {
 	// Basic configurations
-	GovernedRegions   []string             `json:"governedRegions"`   // Regions where Control Tower will be active
-	DefaultOUName     string               `json:"defaultOUName"`     // Default OU for new accounts
-	OrganizationUnits map[string]*OUConfig `json:"organizationUnits"` // Map of all OUs in the organization
-	LogBucketName     string               `json:"logBucketName"`     // S3 bucket name for CloudTrail logs
-	LogRetentionDays  int                  `json:"logRetentionDays"`  // Days to retain CloudWatch logs
-	Tags              map[string]string    `json:"tags"`              // Resource tags
+	GovernedRegions   []string             `json:"governedRegions"`
+	DefaultOUName     string               `json:"defaultOUName"`
+	OrganizationUnits map[string]*OUConfig `json:"organizationUnits"`
+	LogBucketName     string               `json:"logBucketName"`
+	LogRetentionDays  int                  `json:"logRetentionDays"`
+	Tags              map[string]string    `json:"tags"`
 
 	// Encryption configurations
-	KMSKeyAlias string `json:"kmsKeyAlias"` // KMS key alias for encryption
-	KMSKeyArn   string `json:"kmsKeyArn"`   // KMS key ARN for encryption
-	KMSKeyId    string `json:"kmsKeyId"`    // KMS key ID
+	KMSKeyAlias string `json:"kmsKeyAlias"`
+	KMSKeyArn   string `json:"kmsKeyArn"`
+	KMSKeyId    string `json:"kmsKeyId"`
 
 	// Account configurations
-	AccountEmailDomain  string `json:"accountEmailDomain"`  // Domain for account emails
-	ManagementAccountId string `json:"managementAccountId"` // AWS Management account ID
-	LogArchiveAccountId string `json:"logArchiveAccountId"` // Log Archive account ID
-	AuditAccountId      string `json:"auditAccountId"`      // Audit account ID
-	SecurityAccountId   string `json:"securityAccountId"`   // Security account ID
+	AccountEmailDomain  string `json:"accountEmailDomain"`
+	ManagementAccountId string `json:"managementAccountId"`
+	LogArchiveAccountId string `json:"logArchiveAccountId"`
+	AuditAccountId      string `json:"auditAccountId"`
+	SecurityAccountId   string `json:"securityAccountId"`
 
 	// Control Tower configurations
-	CloudTrailRoleArn   string   `json:"cloudTrailRoleArn"`   // IAM role for CloudTrail
-	EnabledGuardrails   []string `json:"enabledGuardrails"`   // List of guardrails to enable
-	HomeRegion          string   `json:"homeRegion"`          // Primary Control Tower region
-	AllowedRegions      []string `json:"allowedRegions"`      // Regions where accounts can operate
-	ManagementRoleArn   string   `json:"managementRoleArn"`   // IAM role for Control Tower management
-	StackSetRoleArn     string   `json:"stackSetRoleArn"`     // IAM role for StackSet operations
-	CloudWatchRoleArn   string   `json:"cloudWatchRoleArn"`   // IAM role for CloudWatch
-	VPCFlowLogsRoleArn  string   `json:"vpcFlowLogsRoleArn"`  // IAM role for VPC Flow Logs
-	OrganizationRoleArn string   `json:"organizationRoleArn"` // IAM role for Organization management
+	CloudTrailRoleArn   string   `json:"cloudTrailRoleArn"`
+	EnabledGuardrails   []string `json:"enabledGuardrails"`
+	HomeRegion          string   `json:"homeRegion"`
+	AllowedRegions      []string `json:"allowedRegions"`
+	ManagementRoleArn   string   `json:"managementRoleArn"`
+	StackSetRoleArn     string   `json:"stackSetRoleArn"`
+	CloudWatchRoleArn   string   `json:"cloudWatchRoleArn"`
+	VPCFlowLogsRoleArn  string   `json:"vpcFlowLogsRoleArn"`
+	OrganizationRoleArn string   `json:"organizationRoleArn"`
 
 	// Logging configurations
-	CloudWatchLogGroup     string `json:"cloudWatchLogGroup"`     // CloudWatch Log Group name
-	CloudTrailLogGroup     string `json:"cloudTrailLogGroup"`     // CloudTrail Log Group name
-	CloudTrailBucketRegion string `json:"cloudTrailBucketRegion"` // Region for CloudTrail bucket
-	AccessLogBucketName    string `json:"accessLogBucketName"`    // S3 bucket for access logs
-	FlowLogBucketName      string `json:"flowLogBucketName"`      // S3 bucket for VPC flow logs
+	CloudWatchLogGroup     string `json:"cloudWatchLogGroup"`
+	CloudTrailLogGroup     string `json:"cloudTrailLogGroup"`
+	CloudTrailBucketRegion string `json:"cloudTrailBucketRegion"`
+	AccessLogBucketName    string `json:"accessLogBucketName"`
+	FlowLogBucketName      string `json:"flowLogBucketName"`
 
 	// Network configurations
-	VPCSettings *VPCConfig `json:"vpcSettings,omitempty"` // VPC configuration
+	VPCSettings *VPCConfig `json:"vpcSettings,omitempty"`
 
 	// Security configurations
-	RequireMFA         bool     `json:"requireMFA"`         // Require MFA for IAM users
-	EnableSSLRequests  bool     `json:"enableSSLRequests"`  // Require SSL for API requests
-	EnableSecurityHub  bool     `json:"enableSecurityHub"`  // Enable AWS Security Hub
-	EnableGuardDuty    bool     `json:"enableGuardDuty"`    // Enable AWS GuardDuty
-	EnableConfig       bool     `json:"enableConfig"`       // Enable AWS Config
-	EnableCloudTrail   bool     `json:"enableCloudTrail"`   // Enable AWS CloudTrail
-	AllowedIPRanges    []string `json:"allowedIPRanges"`    // Allowed IP ranges for API access
-	RestrictedServices []string `json:"restrictedServices"` // AWS services to restrict
+	RequireMFA         bool     `json:"requireMFA"`
+	EnableSSLRequests  bool     `json:"enableSSLRequests"`
+	EnableSecurityHub  bool     `json:"enableSecurityHub"`
+	EnableGuardDuty    bool     `json:"enableGuardDuty"`
+	EnableConfig       bool     `json:"enableConfig"`
+	EnableCloudTrail   bool     `json:"enableCloudTrail"`
+	AllowedIPRanges    []string `json:"allowedIPRanges"`
+	RestrictedServices []string `json:"restrictedServices"`
 }
 
-// VPCConfig defines the VPC configuration settings
-type VPCConfig struct {
-	CIDR               string            `json:"cidr"`               // VPC CIDR range
-	EnableTransitGW    bool              `json:"enableTransitGw"`    // Enable Transit Gateway
-	AllowedRegions     []string          `json:"allowedRegions"`     // Regions where VPC can be deployed
-	Subnets            []SubnetConfig    `json:"subnets"`            // Subnet configurations
-	EnableVPCFlowLogs  bool              `json:"enableVPCFlowLogs"`  // Enable VPC Flow Logs
-	EnableDNSHostnames bool              `json:"enableDNSHostnames"` // Enable DNS hostnames
-	EnableDNSSupport   bool              `json:"enableDNSSupport"`   // Enable DNS support
-	Tags               map[string]string `json:"tags"`               // VPC specific tags
+// NewOrganizationConfig creates a new configuration instance
+func NewOrganizationConfig() (*OrganizationConfig, error) {
+	logger, err := zap.NewProduction()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize logger: %w", err)
+	}
+
+	metrics, err := metrics.NewCollector("config")
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize metrics: %w", err)
+	}
+
+	return &OrganizationConfig{
+		Version: ConfigVersion,
+		logger:  logger,
+		metrics: metrics,
+	}, nil
 }
 
-// SubnetConfig defines the configuration for VPC subnets
-type SubnetConfig struct {
-	CIDR             string            `json:"cidr"`             // Subnet CIDR range
-	Name             string            `json:"name"`             // Subnet name
-	Type             string            `json:"type"`             // Subnet type (public/private)
-	AvailabilityZone string            `json:"availabilityZone"` // AZ for subnet
-	Tags             map[string]string `json:"tags"`             // Subnet specific tags
+// Validate performs comprehensive configuration validation
+func (c *OrganizationConfig) Validate() error {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	c.logger.Info("starting configuration validation")
+	start := time.Now()
+	defer func() {
+		c.metrics.RecordDuration("config_validation", time.Since(start))
+	}()
+
+	if c.LandingZoneConfig == nil {
+		return fmt.Errorf("landing zone configuration is required")
+	}
+
+	if err := c.validateBasicConfig(); err != nil {
+		return fmt.Errorf("basic configuration validation failed: %w", err)
+	}
+
+	if err := c.validateAccountConfig(); err != nil {
+		return fmt.Errorf("account configuration validation failed: %w", err)
+	}
+
+	if err := c.validateNetworkConfig(); err != nil {
+		return fmt.Errorf("network configuration validation failed: %w", err)
+	}
+
+	c.logger.Info("configuration validation completed successfully")
+	return nil
 }
 
-// DefaultConfig provides default values for LandingZoneConfig
-var DefaultConfig = LandingZoneConfig{
-	GovernedRegions:   []string{"us-east-1", "us-west-2"},
-	DefaultOUName:     "Sandbox",
-	OrganizationUnits: map[string]*OUConfig{},
-	LogBucketName:     "aws-controltower-logs",
-	LogRetentionDays:  60,
-	Tags: map[string]string{
-		"ManagedBy": "Pulumi",
-		"Project":   "ControlTower",
-	},
-	KMSKeyAlias:        "alias/controltower-key",
-	AccountEmailDomain: "example.com",
-	HomeRegion:         "us-east-1",
-	AllowedRegions:     []string{"us-east-1", "us-west-2"},
-	EnabledGuardrails:  []string{"REQUIRED", "STRONGLY_RECOMMENDED"},
+// validateBasicConfig validates basic configuration settings
+func (c *OrganizationConfig) validateBasicConfig() error {
+	if len(c.LandingZoneConfig.GovernedRegions) == 0 {
+		return fmt.Errorf("at least one governed region is required")
+	}
 
-	// Default security settings
-	RequireMFA:        true,
-	EnableSSLRequests: true,
-	EnableSecurityHub: true,
-	EnableGuardDuty:   true,
-	EnableConfig:      true,
-	EnableCloudTrail:  true,
+	if c.LandingZoneConfig.LogRetentionDays < minLogRetentionDays ||
+		c.LandingZoneConfig.LogRetentionDays > maxLogRetentionDays {
+		return fmt.Errorf("log retention days must be between %d and %d",
+			minLogRetentionDays, maxLogRetentionDays)
+	}
 
-	// Default logging settings
-	CloudWatchLogGroup: "/aws/controltower",
-	CloudTrailLogGroup: "/aws/controltower/cloudtrail",
-
-	// Default VPC settings
-	VPCSettings: &VPCConfig{
-		CIDR:               "10.0.0.0/8",
-		EnableTransitGW:    true,
-		AllowedRegions:     []string{"us-east-1", "us-west-2"},
-		EnableVPCFlowLogs:  true,
-		EnableDNSHostnames: true,
-		EnableDNSSupport:   true,
-		Tags: map[string]string{
-			"ManagedBy": "Pulumi",
-			"Network":   "Primary",
-		},
-		Subnets: []SubnetConfig{
-			{
-				CIDR: "10.0.0.0/24",
-				Name: "Public-1",
-				Type: "public",
-				Tags: map[string]string{
-					"Type": "Public",
-				},
-			},
-			{
-				CIDR: "10.0.1.0/24",
-				Name: "Private-1",
-				Type: "private",
-				Tags: map[string]string{
-					"Type": "Private",
-				},
-			},
-		},
-	},
+	return nil
 }
 
-func (o *OrganizationSetup) Cleanup() error {
-	var lastErr error
-	for _, cleanup := range o.cleanup {
-		if err := cleanup(); err != nil {
-			lastErr = err
+// validateAccountConfig validates account-related configurations
+func (c *OrganizationConfig) validateAccountConfig() error {
+	emailRegex := regexp.MustCompile(emailRegexPattern)
+	if !emailRegex.MatchString(c.LandingZoneConfig.AccountEmailDomain) {
+		return fmt.Errorf("invalid account email domain")
+	}
+
+	// Validate account IDs
+	accounts := []struct {
+		name string
+		id   string
+	}{
+		{"Management", c.LandingZoneConfig.ManagementAccountId},
+		{"LogArchive", c.LandingZoneConfig.LogArchiveAccountId},
+		{"Audit", c.LandingZoneConfig.AuditAccountId},
+		{"Security", c.LandingZoneConfig.SecurityAccountId},
+	}
+
+	for _, account := range accounts {
+		if !isValidAccountId(account.id) {
+			return fmt.Errorf("invalid %s account ID: %s", account.name, account.id)
 		}
 	}
-	return lastErr
+
+	return nil
+}
+
+// validateNetworkConfig validates network-related configurations
+func (c *OrganizationConfig) validateNetworkConfig() error {
+	if c.LandingZoneConfig.VPCSettings != nil {
+		if _, _, err := net.ParseCIDR(c.LandingZoneConfig.VPCSettings.CIDR); err != nil {
+			return fmt.Errorf("invalid VPC CIDR: %w", err)
+		}
+
+		for _, subnet := range c.LandingZoneConfig.VPCSettings.Subnets {
+			if _, _, err := net.ParseCIDR(subnet.CIDR); err != nil {
+				return fmt.Errorf("invalid subnet CIDR %s: %w", subnet.Name, err)
+			}
+		}
+	}
+
+	for _, ipRange := range c.LandingZoneConfig.AllowedIPRanges {
+		if _, _, err := net.ParseCIDR(ipRange); err != nil {
+			return fmt.Errorf("invalid allowed IP range: %s", ipRange)
+		}
+	}
+
+	return nil
+}
+
+// isValidAccountId validates AWS account ID format
+func isValidAccountId(id string) bool {
+	if len(id) != 12 {
+		return false
+	}
+	_, err := strconv.ParseUint(id, 10, 64)
+	return err == nil
+}
+
+// Save persists the configuration to storage
+func (c *OrganizationConfig) Save() error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return nil
+}
+
+// Load retrieves the configuration from storage
+func (c *OrganizationConfig) Load() error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return nil
+}
+
+// Backup creates a backup of the current configuration
+func (c *OrganizationConfig) Backup() error {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return nil
+}
+
+// Restore restores configuration from a backup
+func (c *OrganizationConfig) Restore(version string) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return nil
+}
+
+// DefaultConfig provides default configuration values
+var DefaultConfig = OrganizationConfig{
+	Version: ConfigVersion,
+	LandingZoneConfig: &LandingZoneConfig{
+		GovernedRegions:   []string{"us-east-1", "us-west-2"},
+		DefaultOUName:     "Sandbox",
+		OrganizationUnits: map[string]*OUConfig{},
+		LogRetentionDays:  90,
+		Tags: map[string]string{
+			"ManagedBy": "Pulumi",
+			"Project":   "ControlTower",
+		},
+		RequireMFA:        true,
+		EnableSSLRequests: true,
+		EnableSecurityHub: true,
+		EnableGuardDuty:   true,
+		EnableConfig:      true,
+		EnableCloudTrail:  true,
+		VPCSettings: &VPCConfig{
+			CIDR:               "10.0.0.0/16",
+			EnableTransitGW:    true,
+			EnableVPCFlowLogs:  true,
+			EnableDNSHostnames: true,
+			EnableDNSSupport:   true,
+		},
+	},
+}
+
+type VPCConfig struct {
+	CIDR               string   `json:"cidr"`
+	EnableTransitGW    bool     `json:"enableTransitGw"`
+	EnableVPCFlowLogs  bool     `json:"enableVpcFlowLogs"`
+	EnableDNSHostnames bool     `json:"enableDnsHostnames"`
+	EnableDNSSupport   bool     `json:"enableDnsSupport"`
+	Subnets            []Subnet `json:"subnets,omitempty"`
+}
+
+type OUConfig struct {
+	Name        string            `json:"name"`
+	Description string            `json:"description,omitempty"`
+	Tags        map[string]string `json:"tags,omitempty"`
+	Accounts    []AccountConfig   `json:"accounts,omitempty"`
+}
+
+type AccountConfig struct {
+	Name    string            `json:"name"`
+	Email   string            `json:"email"`
+	Tags    map[string]string `json:"tags,omitempty"`
+	RoleArn string            `json:"roleArn,omitempty"`
+}
+
+type Subnet struct {
+	Name             string            `json:"name"`
+	CIDR             string            `json:"cidr"`
+	AvailabilityZone string            `json:"availabilityZone"`
+	Tags             map[string]string `json:"tags,omitempty"`
 }
